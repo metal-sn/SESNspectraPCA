@@ -485,7 +485,8 @@ class SNIDsn:
     def restoreContinuum(self, verbose=False, spl_a_ind=0, spl_b_ind=-1):
         """
         Restores the SNID continuum for all spectra. The spectra with the
-        continuum restored fluxes is stored in self.data_unflat
+        continuum restored fluxes is stored in self.data_unflat and 
+        the restored values are in physical units.
 
         Parameters
         ----------
@@ -562,7 +563,7 @@ class SNIDsn:
             unflat = np.array(unflat)
             zeromsk = np.logical_or(wvl < spline_x_wvl[spl_a_ind], wvl > spline_x_wvl[spl_b_ind])
             unflat[zeromsk] = 0.0
-            unflat = unflat/dwbin/np.mean(unflat[msk]/dwbin[msk])
+            unflat = unflat/dwbin
             data_unflat.append(unflat)
         self.data_unflat = np.array(data_unflat).T
         return
