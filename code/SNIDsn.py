@@ -377,6 +377,145 @@ def convert_xknot_wvl(xknot, nw, wvl):
     wave = np.interp(xknot,pix,wvl)
     return wave
 
+
+def rebin(nwave, wave, fsrc, nlog, w0, dwlog):
+    """
+    Rebin fluxes onto a logspaced wavelength grid.
+
+    Parameters
+    ----------
+    nwave : int
+        Number of original wavelength bins
+    wave : ndarray
+        Original wavelengths
+    fsrc : ndarray
+        Original fluxes
+    nlog : int
+        Number of desired logspaced wavelength bins
+    w0 : int
+        Starting wavelength of logspaced grid
+    dwlog : float
+        width of logspaced bins
+
+    Returns
+    -------
+    fdest : ndarray
+        Fluxes rebinned onto logspaced wavelength grid
+
+    """
+    fdest = np.zeros(nlog)
+
+    for i in range(nwave):
+        if i == 0:
+            s0 = 0.5 * (3 * wave[i] - wave[i + 1])
+            s1 = 0.5 * (wave[i] + wave[i + 1])
+        elif i == nwave - 1:
+            s0 = 0.5 * (wave[i - 1] + wave[i])
+            s1 = 0.5 * (3 * wave[i] - wave[i - 1])
+        else:
+            s0 = 0.5 * (wave[i - 1] + wave[i])
+            s1 = 0.5 * (wave[i] + wave[i + 1])
+
+        s0log = np.log10(s0 / w0) / dwlog + 1
+        s1log = np.log10(s1 / w0) / dwlog + 1
+        dnu = (s1 - s0)
+
+        for j in np.arange(int(s0log), int(s1log) + 1):
+            if j < 0 or j > nlog - 1: continue
+            alen = min(s1log, j + 1) - max(s0log, j)
+            flux = fsrc[i] * alen / (s1log - s0log) * dnu
+            fdest[j] = fdest[j] + flux
+
+    return fdest
+
+
+def meanzero(n, y, ioff):
+    """
+    Calculates the knots for a cubic spline to fit the spectrum,
+    then divides out the spline fit in order to flatten the
+    spectrum.
+
+    Parameters
+    ----------
+    n : int
+        Number of wavelength bins. For SNID always 1024.
+    y : ndarray
+        Fluxes rebinned onto SNID wavelength grid.
+    ioff : int
+        Offset parameter unused by SNID
+
+    Returns
+    -------
+    l1 : int
+        first index of nonzero fluxes
+    l2 : int
+        last index of nonzero fluxes
+    ynorm : ndarray
+        Fluxes with edge pixels zeroed
+    nknot : int
+        Number of knots
+    xknot : ndarray
+        x values of knots in pixels
+    yknot : ndarray
+        y values of knots
+
+
+    """
+    xknot = []
+    yknot = []
+    knotchoice = 2
+    knotnum = 13
+
+    ynorm = np.copy(y)
+
+    nedge = 1
+    l1 = 0
+    nuke = 0
+
+    while (l1 < n and (y[l1] <= 0 or nuke < nedge)):
+        if (y[l1] >= 0): nuke = nuke + 1
+        ynorm[l1] = 0.0
+        l1 = l1 + 1
+
+    l2 = n - 1
+    nuke = 0
+
+    while (l2 >= 0 and (y[l2] <= 0 or nuke < nedge)):
+        if (y[l2] >= 0): nuke = nuke + 1
+        ynorm[l2] = 0.0
+        l2 = l2 - 1
+
+    if knotchoice == 1:
+        pass
+    elif knotchoice == 2:
+        nknot = 0
+        kwidth = int(n / knotnum)
+        nave = 0
+        wave = 0
+        fave = 0
+        istart = 0
+        # luckily SNID doesnt seem to use ioff because the line below seems wrong.
+        if (ioff > 0): istart = (ioff % kwidth) - kwidth
+        for i in range(n):
+            if (i > l1 and i < l2):
+                nave = nave + 1
+                wave = wave + i + 0.5
+                fave = fave + y[i]
+            if ((i - istart) % kwidth == 0):
+                if (nave > 0 and fave > 0):
+                    nknot = nknot + 1
+                    # xknot.append(np.log10(wave / nave))
+                    # yknot.append(np.log10(fave / nave) - np.log10(np.mean(y)))
+                    xknot.append(wave / nave)
+                    yknot.append(np.log10(fave / nave))
+                nave = 0
+                wave = 0
+                fave = 0
+
+    else:
+        print("must make a choice for knotchoice")
+    return l1, l2, ynorm, nknot, xknot, yknot
+
 class SNIDsn:
     def __init__(self):
         self.header = None
@@ -480,6 +619,73 @@ class SNIDsn:
         specMean = np.mean(self.data[phasekey])
         specStd = np.std(self.data[phasekey])
         self.data[phasekey] = (self.data[phasekey] - specMean)/specStd
+        return
+
+    def removeContinuum(self):
+        """
+        Removes the continuum from all the spectra in a SNIDsn object
+        by fitting a cubic spline to each spectrum and dividing by
+        the spline fit. Mean is zeroed. Continuum removal implemented
+        to mimic the behavior of SNID. Continuum removed fluxes
+        replace the original flux values, and data is rebinned onto
+        the SNID logspaced wavelength grid.
+
+        Returns
+        -------
+
+        """
+
+
+        nknot_arr = []
+        xknot_arr = []
+        yknot_arr = []
+        fmean_arr = []
+
+        snidwvl, dwbin, dwlog = snid_wvl_axis()
+        nspec = self.data.shape[1]
+        newdata = np.zeros((len(snidwvl), nspec), dtype=self.data.dtype)
+
+        for phkey in self.data.dtype.names:
+            wvl = self.wavelengths
+            flux = self.data[phkey]
+            frebin = rebin(len(wvl), wvl, flux, len(snidwvl), 2500, dwlog)
+            l1, l2, ynorm, nknot, xknot, yknot = meanzero(len(snidwvl), frebin, -1)
+            nknot_arr.append(nknot)
+            xknot_arr.append(np.log10(xknot))
+            xknot_wvl = [convert_xknot_wvl(xk, len(snidwvl), snidwvl) for xk in xknot]
+            fmean = np.mean(np.log10(ynorm[ynorm > 0]))
+            fmean_arr.append(fmean)
+            yknot_arr.append(yknot - fmean)
+
+            spl = CubicSpline(xknot_wvl, np.power(10, yknot))
+            flux_removed = ynorm / spl(snidwvl) - 1
+            newdata[phkey] = flux_removed
+
+        continuum_header = []
+        continuum_header.append(max(nknot_arr))
+        for i in range(len(fmean_arr)):
+            continuum_header.append(nknot_arr[i])
+            continuum_header.append(fmean_arr[i])
+        continuum_header = np.array(continuum_header)
+
+        continuum_knots = np.nan * np.ones((max(nknot_arr), 2*len(xknot_wvl) + 1))
+        knot_ind = np.arange(1, max(nknot_arr) + 1)
+        continuum_knots[:, 0] = knot_ind
+
+        for i,xk in enumerate(xknot_arr):
+            ind = 2 * i + 1
+            continuum_knots[:nknot_arr[i], ind] = xk
+        for i,yk in enumerate(yknot_arr):
+            ind = 2 * (i + 1)
+            continuum_knots[:nknot_arr[i], ind] = yk
+
+        self.continuum = np.row_stack(continuum_header, continuum_knots)
+        self.data = newdata
+        self.wavelengths = snidwvl
+
+        return
+
+
         return
 
     def restoreContinuum(self, verbose=False, spl_a_ind=0, spl_b_ind=-1):
