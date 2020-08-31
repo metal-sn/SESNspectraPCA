@@ -347,8 +347,8 @@ def snid_wvl_axis():
     nw = 1024
     w0 = 2500
     w1 = 10000
-    dwlog = np.log(w1/w0)/nw
-    wlog = w0*np.exp(np.arange(nw+1)*dwlog)
+    dwlog = np.log10(w1/w0)/nw
+    wlog = w0*np.power(10, np.arange(nw+1)*dwlog)
     dwbin = np.diff(wlog)
     new_wlog = []
     for i in range(nw):
@@ -516,6 +516,18 @@ def meanzero(n, y, ioff):
         print("must make a choice for knotchoice")
     return l1, l2, ynorm, nknot, xknot, yknot
 
+
+def apodize(maxlog, l1, l2, flux, percent):
+    outflux = np.copy(flux)
+    nsquash = min(maxlog*0.01*percent, (l2-l1)/2.0)
+    if nsquash < 1: return outflux
+    for i in range(int(nsquash)):
+        arg = np.pi * i/(nsquash - 1)
+        factor = 0.5 * (1 - np.cos(arg))
+        outflux[l1+i] = factor * flux[l1+i]
+        outflux[l2-i] = factor * flux[l2-i]
+    return outflux
+
 class SNIDsn:
     def __init__(self):
         self.header = None
@@ -531,6 +543,84 @@ class SNIDsn:
         self.smooth_uncertainty = dict()
 
         return
+
+    def loadSN(self, file, phaseType, TypeInt, SubTypeInt, TypeStr, Nspec, Nbins, WvlStart, WvlEnd,
+               SN, redshift):
+        """
+        Loads an ascii SNID template file specified by the path file into
+        a SNIDsn object. The file must only have wavelengths in the first column
+        and fluxes in subsequent columns. The first line must also have the phases,
+        with the first entry in the first line being the phase type.
+        Parameters
+        ----------
+        file : string
+            path to SNID template file produced by logwave.
+        phaseType : integer
+            integer value that specifies whether phases are defined relative to max
+        TypeInt : integer
+            integer value that specifies the type of the supernova
+        SubTypeInt : integer
+            integer value that specifies the subtype of the supernova
+        TypeStr : string
+            specifies the type and subtype of the supernova
+        Nspec : integer
+            integer value that specifies the number of phases at which fluxes were measured
+        Nbins : integer
+            integer value that specifies the total number of flux measurements for each phase
+        WvlStart : float
+            float value that specifies the lowest wavelength value measured
+        WvlEnd : float
+            float value that specifies the highest wavelength value measured
+        SN : string
+            name of the supernova
+        Returns
+        -------
+        """
+
+        assert file[-3:] != 'lnw'  # file cannot be .lnw
+
+        self.phaseType = phaseType
+
+        header = dict()
+        header['Nspec'] = Nspec
+        header['Nbins'] = Nbins
+        header['WvlStart'] = WvlStart
+        header['WvlEnd'] = WvlEnd
+        header['SN'] = SN
+        header['TypeStr'] = TypeStr
+        header['TypeInt'] = TypeInt
+        header['SubTypeInt'] = SubTypeInt
+        self.header = header
+
+        tp, subtp = getType(header['TypeInt'], header['SubTypeInt'])
+        self.type = tp
+        self.subtype = subtp
+
+        all_data = np.loadtxt(file)
+
+        header_line = all_data[0]
+        phases = header_line[1:]
+        self.phases = phases
+
+        self.wavelengths = all_data[1:, 0]/(1+redshift)
+
+        filedtype = []
+        colnames = []
+        for ph in self.phases:
+            colname = 'Ph' + str(ph)
+            if colname in colnames:
+                colname = colname + 'v1'
+            count = 2
+            while (colname in colnames):
+                colname = colname[0:-2] + 'v' + str(count)
+                count = count + 1
+            colnames.append(colname)
+            dt = (colname, 'f4')
+            filedtype.append(dt)
+        data = np.loadtxt(file, dtype=filedtype, skiprows=1, usecols=range(1, len(self.phases) + 1))
+        self.data = data
+        return
+
 
     def loadSNIDlnw(self, lnwfile):
         """
@@ -642,8 +732,8 @@ class SNIDsn:
         fmean_arr = []
 
         snidwvl, dwbin, dwlog = snid_wvl_axis()
-        nspec = self.data.shape[1]
-        newdata = np.zeros((len(snidwvl), nspec), dtype=self.data.dtype)
+        nspec = len(self.data.dtype.names)
+        newdata = np.zeros((len(snidwvl),), dtype=self.data.dtype)
 
         for phkey in self.data.dtype.names:
             wvl = self.wavelengths
@@ -668,7 +758,7 @@ class SNIDsn:
             continuum_header.append(fmean_arr[i])
         continuum_header = np.array(continuum_header)
 
-        continuum_knots = np.nan * np.ones((max(nknot_arr), 2*len(xknot_wvl) + 1))
+        continuum_knots = np.nan * np.ones((max(nknot_arr), 2*len(newdata.dtype.names) + 1))
         knot_ind = np.arange(1, max(nknot_arr) + 1)
         continuum_knots[:, 0] = knot_ind
 
@@ -679,7 +769,7 @@ class SNIDsn:
             ind = 2 * (i + 1)
             continuum_knots[:nknot_arr[i], ind] = yk
 
-        self.continuum = np.row_stack(continuum_header, continuum_knots)
+        self.continuum = np.row_stack((continuum_header, continuum_knots))
         self.data = newdata
         self.wavelengths = snidwvl
 
