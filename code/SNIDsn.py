@@ -347,8 +347,8 @@ def snid_wvl_axis():
     nw = 1024
     w0 = 2500
     w1 = 10000
-    dwlog = np.log(w1/w0)/nw
-    wlog = w0*np.exp(np.arange(nw+1)*dwlog)
+    dwlog = np.log10(w1/w0)/nw
+    wlog = w0*np.power(10, np.arange(nw+1)*dwlog)
     dwbin = np.diff(wlog)
     new_wlog = []
     for i in range(nw):
@@ -377,6 +377,157 @@ def convert_xknot_wvl(xknot, nw, wvl):
     wave = np.interp(xknot,pix,wvl)
     return wave
 
+
+def rebin(nwave, wave, fsrc, nlog, w0, dwlog):
+    """
+    Rebin fluxes onto a logspaced wavelength grid.
+
+    Parameters
+    ----------
+    nwave : int
+        Number of original wavelength bins
+    wave : ndarray
+        Original wavelengths
+    fsrc : ndarray
+        Original fluxes
+    nlog : int
+        Number of desired logspaced wavelength bins
+    w0 : int
+        Starting wavelength of logspaced grid
+    dwlog : float
+        width of logspaced bins
+
+    Returns
+    -------
+    fdest : ndarray
+        Fluxes rebinned onto logspaced wavelength grid
+
+    """
+    fdest = np.zeros(nlog)
+
+    for i in range(nwave):
+        if i == 0:
+            s0 = 0.5 * (3 * wave[i] - wave[i + 1])
+            s1 = 0.5 * (wave[i] + wave[i + 1])
+        elif i == nwave - 1:
+            s0 = 0.5 * (wave[i - 1] + wave[i])
+            s1 = 0.5 * (3 * wave[i] - wave[i - 1])
+        else:
+            s0 = 0.5 * (wave[i - 1] + wave[i])
+            s1 = 0.5 * (wave[i] + wave[i + 1])
+
+        s0log = np.log10(s0 / w0) / dwlog + 1
+        s1log = np.log10(s1 / w0) / dwlog + 1
+        dnu = (s1 - s0)
+
+        for j in np.arange(int(s0log), int(s1log) + 1):
+            if j < 0 or j > nlog - 1: continue
+            alen = min(s1log, j + 1) - max(s0log, j)
+            flux = fsrc[i] * alen / (s1log - s0log) * dnu
+            fdest[j] = fdest[j] + flux
+
+    return fdest
+
+
+def meanzero(n, y, ioff):
+    """
+    Calculates the knots for a cubic spline to fit the spectrum,
+    then divides out the spline fit in order to flatten the
+    spectrum.
+
+    Parameters
+    ----------
+    n : int
+        Number of wavelength bins. For SNID always 1024.
+    y : ndarray
+        Fluxes rebinned onto SNID wavelength grid.
+    ioff : int
+        Offset parameter unused by SNID
+
+    Returns
+    -------
+    l1 : int
+        first index of nonzero fluxes
+    l2 : int
+        last index of nonzero fluxes
+    ynorm : ndarray
+        Fluxes with edge pixels zeroed
+    nknot : int
+        Number of knots
+    xknot : ndarray
+        x values of knots in pixels
+    yknot : ndarray
+        y values of knots
+
+
+    """
+    xknot = []
+    yknot = []
+    knotchoice = 2
+    knotnum = 13
+
+    ynorm = np.copy(y)
+
+    nedge = 1
+    l1 = 0
+    nuke = 0
+
+    while (l1 < n and (y[l1] <= 0 or nuke < nedge)):
+        if (y[l1] >= 0): nuke = nuke + 1
+        ynorm[l1] = 0.0
+        l1 = l1 + 1
+
+    l2 = n - 1
+    nuke = 0
+
+    while (l2 >= 0 and (y[l2] <= 0 or nuke < nedge)):
+        if (y[l2] >= 0): nuke = nuke + 1
+        ynorm[l2] = 0.0
+        l2 = l2 - 1
+
+    if knotchoice == 1:
+        pass
+    elif knotchoice == 2:
+        nknot = 0
+        kwidth = int(n / knotnum)
+        nave = 0
+        wave = 0
+        fave = 0
+        istart = 0
+        # luckily SNID doesnt seem to use ioff because the line below seems wrong.
+        if (ioff > 0): istart = (ioff % kwidth) - kwidth
+        for i in range(n):
+            if (i > l1 and i < l2):
+                nave = nave + 1
+                wave = wave + i + 0.5
+                fave = fave + y[i]
+            if ((i - istart) % kwidth == 0):
+                if (nave > 0 and fave > 0):
+                    nknot = nknot + 1
+                    # xknot.append(np.log10(wave / nave))
+                    # yknot.append(np.log10(fave / nave) - np.log10(np.mean(y)))
+                    xknot.append(wave / nave)
+                    yknot.append(np.log10(fave / nave))
+                nave = 0
+                wave = 0
+                fave = 0
+
+    else:
+        print("must make a choice for knotchoice")
+    return l1, l2, ynorm, nknot, xknot, yknot
+
+
+def apodize(maxlog, l1, l2, flux, percent):
+    outflux = np.copy(flux)
+    nsquash = min(maxlog*0.01*percent, (l2-l1)/2.0)
+    if nsquash < 1: return outflux
+    for i in range(int(nsquash)):
+        arg = np.pi * i/(nsquash - 1)
+        factor = 0.5 * (1 - np.cos(arg))
+        outflux[l1+i] = factor * flux[l1+i]
+        outflux[l2-i] = factor * flux[l2-i]
+    return outflux
+
 class SNIDsn:
     def __init__(self):
         self.header = None
@@ -392,6 +543,84 @@ class SNIDsn:
         self.smooth_uncertainty = dict()
 
         return
+
+    def loadSN(self, file, phaseType, TypeInt, SubTypeInt, TypeStr, Nspec, Nbins, WvlStart, WvlEnd,
+               SN, redshift):
+        """
+        Loads an ascii SNID template file specified by the path file into
+        a SNIDsn object. The file must only have wavelengths in the first column
+        and fluxes in subsequent columns. The first line must also have the phases,
+        with the first entry in the first line being the phase type.
+        Parameters
+        ----------
+        file : string
+            path to SNID template file produced by logwave.
+        phaseType : integer
+            integer value that specifies whether phases are defined relative to max
+        TypeInt : integer
+            integer value that specifies the type of the supernova
+        SubTypeInt : integer
+            integer value that specifies the subtype of the supernova
+        TypeStr : string
+            specifies the type and subtype of the supernova
+        Nspec : integer
+            integer value that specifies the number of phases at which fluxes were measured
+        Nbins : integer
+            integer value that specifies the total number of flux measurements for each phase
+        WvlStart : float
+            float value that specifies the lowest wavelength value measured
+        WvlEnd : float
+            float value that specifies the highest wavelength value measured
+        SN : string
+            name of the supernova
+        Returns
+        -------
+        """
+
+        assert file[-3:] != 'lnw'  # file cannot be .lnw
+
+        self.phaseType = phaseType
+
+        header = dict()
+        header['Nspec'] = Nspec
+        header['Nbins'] = Nbins
+        header['WvlStart'] = WvlStart
+        header['WvlEnd'] = WvlEnd
+        header['SN'] = SN
+        header['TypeStr'] = TypeStr
+        header['TypeInt'] = TypeInt
+        header['SubTypeInt'] = SubTypeInt
+        self.header = header
+
+        tp, subtp = getType(header['TypeInt'], header['SubTypeInt'])
+        self.type = tp
+        self.subtype = subtp
+
+        all_data = np.loadtxt(file)
+
+        header_line = all_data[0]
+        phases = header_line[1:]
+        self.phases = phases
+
+        self.wavelengths = all_data[1:, 0]/(1+redshift)
+
+        filedtype = []
+        colnames = []
+        for ph in self.phases:
+            colname = 'Ph' + str(ph)
+            if colname in colnames:
+                colname = colname + 'v1'
+            count = 2
+            while (colname in colnames):
+                colname = colname[0:-2] + 'v' + str(count)
+                count = count + 1
+            colnames.append(colname)
+            dt = (colname, 'f4')
+            filedtype.append(dt)
+        data = np.loadtxt(file, dtype=filedtype, skiprows=1, usecols=range(1, len(self.phases) + 1))
+        self.data = data
+        return
+
 
     def loadSNIDlnw(self, lnwfile):
         """
@@ -464,6 +693,103 @@ class SNIDsn:
         self.continuum = continuum
         return
 
+    def write_lnw(self, filename):
+        """
+        Writes the data of the SNIDsn object to an output file using the
+        SNID .lnw format. Note that the continuum information is copied
+        from the SNIDsn header, which is not updated if the user makes
+        changes to the spectra. Modified spectra may have inconsistent
+        continuum information. Users should exercise extreme care to modify
+        all relevant SNIDsn header properties before calling this function
+        in order to write consistent .lnw files.
+
+        Parameters
+        ----------
+        filename : string
+            Path to write output file to.
+
+        Returns
+        -------
+
+        """
+        file_lines = []
+        header_items = []
+        header_items.append('   ' + str(self.header['Nspec']))
+        header_items.append(' ' + str(self.header['Nbins']))
+        header_items.append('   ' + str('{:.2f}'.format(self.header['WvlStart'])))
+        header_items.append('  ' + str('{:.2f}'.format(self.header['WvlEnd'])))
+        header_items.append('     ' + str(self.header['SplineKnots']))
+        header_items.append('     ' + str(self.header['SN']))
+        header_items.append('      ' + str(self.header['dm15']))
+        header_items.append('  ' + str(self.header['TypeStr']))
+        header_items.append('     ' + str(self.header['TypeInt']))
+        header_items.append('  ' + str(self.header['SubTypeInt']))
+        header_line = ''
+        for item in header_items:
+            header_line += item
+        file_lines.append(header_line)
+        continuum = self.continuum.tolist()
+        continuum_header = continuum[0]
+        continuum_line = ''
+        for i in range(len(continuum_header)):
+            if float(continuum_header[i]) == int(continuum_header[i]):
+                item = int(continuum_header[i])
+            else:
+                item = continuum_header[i]
+            if i == 0:
+                continuum_line += '     ' + str(item)
+            elif i % 2 == 0:
+                continuum_line += '       ' + str('{:.5f}'.format(item))
+            else:
+                if item >= 10:
+                    continuum_line += ' ' + str(item)
+                else:
+                    continuum_line += '  ' + str(item)
+        file_lines.append(continuum_line)
+        continuum_all = ''
+        for i in range(1, len(continuum)):
+            for j in range(len(continuum[i])):
+                item = str('{:.4f}'.format(continuum[i][j]))
+                if j == 0:
+                    continuum_all += '      ' + str(i)
+                else:
+                    if j % 2 == 0 and float(item) > 0:
+                        continuum_all += '   ' + item
+                    else:
+                        continuum_all += '  ' + item
+            file_lines.append(continuum_all)
+            continuum_all = ''
+        phases = ['       0']
+        str_phase = self.data.dtype.names
+        for phase in str_phase:
+            if float(phase[2:]) < 100:
+                phases.append('   ' + str('{:.3f}'.format(float(phase[2:]))))
+            else:
+                phases.append('  ' + str('{:.3f}'.format(float(phase[2:]))))
+        file_lines.append(phases)
+        data = self.data.tolist()
+        wvl = self.wavelengths
+        count = 0
+        for line in data:
+            fluxes = []
+            fluxes.append(' ' + str('{:.2f}'.format(wvl[count], 2)))
+            for i in range(len(line)):
+                if line[i] >= 0:
+                    fluxes.append('    ' + str('{:.3f}'.format(line[i], 3)))
+                else:
+                    fluxes.append('   ' + str('{:.3f}'.format(line[i], 3)))
+            count += 1
+            file_lines.append(fluxes)
+        with open(filename, 'x') as lnw:
+            for line in file_lines:
+                for i in range(len(line)):
+                    lnw.write(line[i])
+                lnw.write('\n')
+            lnw.close()
+
+        return
+
+
     def preprocess(self, phasekey):
         """
         Zeros the mean and scales std to 1 for the spectrum indicated.
@@ -482,10 +808,78 @@ class SNIDsn:
         self.data[phasekey] = (self.data[phasekey] - specMean)/specStd
         return
 
+    def removeContinuum(self):
+        """
+        Removes the continuum from all the spectra in a SNIDsn object
+        by fitting a cubic spline to each spectrum and dividing by
+        the spline fit. Mean is zeroed. Continuum removal implemented
+        to mimic the behavior of SNID. Continuum removed fluxes
+        replace the original flux values, and data is rebinned onto
+        the SNID logspaced wavelength grid.
+
+        Returns
+        -------
+
+        """
+
+
+        nknot_arr = []
+        xknot_arr = []
+        yknot_arr = []
+        fmean_arr = []
+
+        snidwvl, dwbin, dwlog = snid_wvl_axis()
+        nspec = len(self.data.dtype.names)
+        newdata = np.zeros((len(snidwvl),), dtype=self.data.dtype)
+
+        for phkey in self.data.dtype.names:
+            wvl = self.wavelengths
+            flux = self.data[phkey]
+            frebin = rebin(len(wvl), wvl, flux, len(snidwvl), 2500, dwlog)
+            l1, l2, ynorm, nknot, xknot, yknot = meanzero(len(snidwvl), frebin, -1)
+            nknot_arr.append(nknot)
+            xknot_arr.append(np.log10(xknot))
+            xknot_wvl = [convert_xknot_wvl(xk, len(snidwvl), snidwvl) for xk in xknot]
+            fmean = np.mean(np.log10(ynorm[ynorm > 0]))
+            fmean_arr.append(fmean)
+            yknot_arr.append(yknot - fmean)
+
+            spl = CubicSpline(xknot_wvl, np.power(10, yknot))
+            flux_removed = ynorm / spl(snidwvl) - 1
+            newdata[phkey] = flux_removed
+
+        continuum_header = []
+        continuum_header.append(max(nknot_arr))
+        for i in range(len(fmean_arr)):
+            continuum_header.append(nknot_arr[i])
+            continuum_header.append(fmean_arr[i])
+        continuum_header = np.array(continuum_header)
+
+        continuum_knots = np.nan * np.ones((max(nknot_arr), 2*len(newdata.dtype.names) + 1))
+        knot_ind = np.arange(1, max(nknot_arr) + 1)
+        continuum_knots[:, 0] = knot_ind
+
+        for i,xk in enumerate(xknot_arr):
+            ind = 2 * i + 1
+            continuum_knots[:nknot_arr[i], ind] = xk
+        for i,yk in enumerate(yknot_arr):
+            ind = 2 * (i + 1)
+            continuum_knots[:nknot_arr[i], ind] = yk
+
+        self.continuum = np.row_stack((continuum_header, continuum_knots))
+        self.data = newdata
+        self.wavelengths = snidwvl
+
+        return
+
+
+        return
+
     def restoreContinuum(self, verbose=False, spl_a_ind=0, spl_b_ind=-1):
         """
         Restores the SNID continuum for all spectra. The spectra with the
-        continuum restored fluxes is stored in self.data_unflat
+        continuum restored fluxes is stored in self.data_unflat and 
+        the restored values are in physical units.
 
         Parameters
         ----------
@@ -562,7 +956,7 @@ class SNIDsn:
             unflat = np.array(unflat)
             zeromsk = np.logical_or(wvl < spline_x_wvl[spl_a_ind], wvl > spline_x_wvl[spl_b_ind])
             unflat[zeromsk] = 0.0
-            unflat = unflat/dwbin/np.mean(unflat[msk]/dwbin[msk])
+            unflat = unflat/dwbin
             data_unflat.append(unflat)
         self.data_unflat = np.array(data_unflat).T
         return
