@@ -460,4 +460,6 @@ def getDiagnostics(dataset):
         snphasetype.append(phtype)
  
     return snnames, snphases, snid_type_pair, snid_type_str, snphasetype
+     
+        
 
